@@ -3,339 +3,98 @@ name: Build zf.earc.top patched APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    paths:
+      - ".github/workflows/build-zf-earc-apk.yml"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Apply zf.earc.top compatibility patch
-        shell: bash
+      - name: Patch source for zf.earc.top
         run: |
           python3 <<'PY'
           from pathlib import Path
-          import sys
 
-          root = Path.cwd()
-          main = root / 'app/src/main/java/com/shinian/pay/ui/MainActivity.java'
-          service = root / 'app/src/main/java/com/shinian/pay/service/PayNotificationListenerService.java'
-          util_dir = root / 'app/src/main/java/com/shinian/pay/util'
-          network = util_dir / 'NetworkCompat.java'
+          main_path = Path("app/src/main/java/com/shinian/pay/ui/MainActivity.java")
+          service_path = Path("app/src/main/java/com/shinian/pay/service/PayNotificationListenerService.java")
 
-          if not main.exists() or not service.exists():
-              print('ERROR: expected Vmq-App project structure not found')
-              sys.exit(1)
+          main = main_path.read_text()
+          service = service_path.read_text()
 
-          util_dir.mkdir(parents=True, exist_ok=True)
-          network.write_text(r'''package com.shinian.pay.util;
+          # 给 MainActivity 增加 Proxy 导入
+          if "import java.net.Proxy;" not in main:
+              main = main.replace(
+                  "import java.net.HttpURLConnection;",
+                  "import java.net.HttpURLConnection;\nimport java.net.Proxy;"
+              )
 
-import android.text.TextUtils;
+          # 给 PayNotificationListenerService 增加 Proxy 导入
+          if "import java.net.Proxy;" not in service:
+              service = service.replace(
+                  "import java.net.HttpURLConnection;",
+                  "import java.net.HttpURLConnection;\nimport java.net.Proxy;"
+              )
 
-import java.net.Proxy;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import java.util.Locale;
-import java.util.concurrent.TimeUnit;
+          # MainActivity：OkHttpClient 改为不走系统代理
+          main = main.replace(
+              "OkHttpClient okHttpClient = new OkHttpClient();",
+              "OkHttpClient okHttpClient = new OkHttpClient.Builder().proxy(Proxy.NO_PROXY).build();"
+          )
 
-import okhttp3.OkHttpClient;
+          # MainActivity：心跳地址改为 https
+          main = main.replace(
+              '"http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign',
+              '"https://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign'
+          )
 
-public final class NetworkCompat {
-    private NetworkCompat() {}
+          main = main.replace(
+              '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
+              '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
+          )
 
-    public static final boolean DEFAULT_PUBLIC_HTTPS = true;
-    public static final boolean BYPASS_SYSTEM_PROXY = true;
+          # Service：OkHttpClient 改为不走系统代理
+          service = service.replace(
+              ".connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)",
+              ".proxy(Proxy.NO_PROXY)\n                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)"
+          )
 
-    public static final class Config {
-        public final String host;
-        public final String key;
-        public final String scheme;
-        public final String baseUrl;
+          # Service：心跳地址改为 https
+          service = service.replace(
+              '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
+              '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
+          )
 
-        private Config(String host, String key, String scheme) {
-            this.host = host;
-            this.key = key;
-            this.scheme = scheme;
-            this.baseUrl = scheme + "://" + host;
-        }
-    }
+          # Service：appPush 地址改为 https
+          service = service.replace(
+              'return "http://" +\n                host +',
+              'return "https://" +\n                host +'
+          )
 
-    public static OkHttpClient newClient() {
-        OkHttpClient.Builder builder = new OkHttpClient.Builder()
-                .connectTimeout(12, TimeUnit.SECONDS)
-                .readTimeout(20, TimeUnit.SECONDS)
-                .writeTimeout(12, TimeUnit.SECONDS)
-                .retryOnConnectionFailure(true);
-        if (BYPASS_SYSTEM_PROXY) {
-            builder.proxy(Proxy.NO_PROXY);
-        }
-        return builder.build();
-    }
+          # Service：你的服务端 appPush 签名规则需要 transMemo，这里先兼容空字符串
+          service = service.replace(
+              "String sign = md5(type + priceStr + t + key);",
+              "String transMemo = \"\";\n        String sign = md5(type + priceStr + t + transMemo + key);"
+          )
 
-    public static Config parseConfig(String raw) {
-        if (TextUtils.isEmpty(raw)) return null;
-        String s = raw.trim().replace("\n", "").replace("\r", "").replace(" ", "");
-        if (s.length() == 0) return null;
+          service = service.replace(
+              "String sign = md5(type + priceStr + t + key);",
+              "String transMemo = \"\";\n                    String sign = md5(type + priceStr + t + transMemo + key);"
+          )
 
-        String scheme = null;
-        String host;
-        String key;
-        try {
-            if (s.startsWith("http://") || s.startsWith("https://")) {
-                URI uri = URI.create(s);
-                scheme = uri.getScheme();
-                host = uri.getHost();
-                if (host == null || host.length() == 0) return null;
-                if (uri.getPort() > 0) host = host + ":" + uri.getPort();
-                String path = uri.getPath();
-                if (TextUtils.isEmpty(path) || path.equals("/")) return null;
-                int lastSlash = path.lastIndexOf('/');
-                key = path.substring(lastSlash + 1);
-            } else {
-                int idx = s.lastIndexOf('/');
-                if (idx <= 0 || idx >= s.length() - 1) return null;
-                host = s.substring(0, idx);
-                key = s.substring(idx + 1);
-            }
-        } catch (Exception e) {
-            return null;
-        }
+          main_path.write_text(main)
+          service_path.write_text(service)
 
-        host = cleanHost(host);
-        key = key == null ? "" : key.trim();
-        if (TextUtils.isEmpty(host) || TextUtils.isEmpty(key)) return null;
-        if (TextUtils.isEmpty(scheme)) scheme = chooseScheme(host);
-        return new Config(host, key, scheme);
-    }
-
-    public static String buildHeartUrl(String host, String t, String sign) {
-        return normalizeBaseUrl(host) + "/appHeart?t=" + enc(t) + "&sign=" + enc(sign);
-    }
-
-    public static String buildPushUrl(String host, int type, String price, String t, String transMemo, String sign) {
-        String memo = transMemo == null ? "" : transMemo;
-        return normalizeBaseUrl(host)
-                + "/appPush?t=" + enc(t)
-                + "&type=" + type
-                + "&price=" + enc(price)
-                + "&transMemo=" + enc(memo)
-                + "&sign=" + enc(sign);
-    }
-
-    public static String normalizeBaseUrl(String rawHost) {
-        if (rawHost == null) rawHost = "";
-        rawHost = rawHost.trim();
-        if (rawHost.startsWith("http://") || rawHost.startsWith("https://")) {
-            try {
-                URI uri = URI.create(rawHost);
-                String h = uri.getHost();
-                if (h != null && h.length() > 0) {
-                    if (uri.getPort() > 0) h = h + ":" + uri.getPort();
-                    return uri.getScheme() + "://" + h;
-                }
-            } catch (Exception ignored) {}
-        }
-        String host = cleanHost(rawHost);
-        return chooseScheme(host) + "://" + host;
-    }
-
-    private static String cleanHost(String host) {
-        if (host == null) return "";
-        host = host.trim();
-        host = host.replaceFirst("^https?://", "");
-        int slash = host.indexOf('/');
-        if (slash >= 0) host = host.substring(0, slash);
-        while (host.endsWith("/")) host = host.substring(0, host.length() - 1);
-        return host;
-    }
-
-    private static String chooseScheme(String host) {
-        String h = host == null ? "" : host.toLowerCase(Locale.ROOT);
-        if (h.startsWith("localhost") || h.startsWith("127.") || h.startsWith("10.")
-                || h.startsWith("192.168.") || h.matches("172\\.(1[6-9]|2[0-9]|3[0-1])\\..*")) {
-            return "http";
-        }
-        return DEFAULT_PUBLIC_HTTPS ? "https" : "http";
-    }
-
-    private static String enc(String s) {
-        try {
-            return URLEncoder.encode(s == null ? "" : s, StandardCharsets.UTF_8.name());
-        } catch (Exception e) {
-            return s == null ? "" : s;
-        }
-    }
-}
-''', encoding='utf-8')
-
-          def replace_once(text, old, new, label):
-              if old not in text:
-                  print('WARN: not found:', label)
-                  return text
-              return text.replace(old, new, 1)
-
-          s = main.read_text(encoding='utf-8')
-          if 'import com.shinian.pay.util.NetworkCompat;' not in s:
-              s = s.replace('import com.shinian.pay.util.SaveImageUtils;\n', 'import com.shinian.pay.util.SaveImageUtils;\nimport com.shinian.pay.util.NetworkCompat;\n')
-
-          s = replace_once(s,
-'''            String[] tmp = scanResult.split("/");
-            if (tmp.length != 2) {
-                Toast.makeText(MainActivity.this, "二维码错误，请您扫描网站上显示的二维码!", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            String t = String.valueOf(new Date().getTime());
-            String sign = md5(t + tmp[1]);
-
-
-            OkHttpClient okHttpClient = new OkHttpClient();
-            Request request = new Request.Builder().url("http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign).method("GET", null).build();''',
-'''            NetworkCompat.Config config = NetworkCompat.parseConfig(scanResult);
-            if (config == null) {
-                Toast.makeText(MainActivity.this, "二维码错误，请您扫描网站上显示的二维码!", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            String t = String.valueOf(new Date().getTime());
-            String sign = md5(t + config.key);
-
-
-            OkHttpClient okHttpClient = NetworkCompat.newClient();
-            Request request = new Request.Builder().url(NetworkCompat.buildHeartUrl(config.host, t, sign)).method("GET", null).build();''',
-'扫码配置心跳')
-
-          s = s.replace('''            txthost.setText(" 通知地址：" + tmp[0]);
-            txtkey.setText(" 通讯密钥：" + tmp[1]);
-            host = tmp[0];
-            key = tmp[1];''', '''            txthost.setText(" 通知地址：" + config.host);
-            txtkey.setText(" 通讯密钥：" + config.key);
-            host = config.host;
-            key = config.key;''', 1)
-
-          s = replace_once(s,
-'''                String[] tmp = scanResult.split("/");
-                if (tmp.length != 2) {
-                    Toast.makeText(MainActivity.this, "数据不能为空或数据错误!", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-
-                String t = String.valueOf(new Date().getTime());
-                String sign = md5(t + tmp[1]);
-
-                OkHttpClient okHttpClient = new OkHttpClient();
-                Request request = new Request.Builder().url("http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign)
-                        .method("GET", null).build();''',
-'''                NetworkCompat.Config config = NetworkCompat.parseConfig(scanResult);
-                if (config == null) {
-                    Toast.makeText(MainActivity.this, "数据不能为空或数据错误!", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-
-                String t = String.valueOf(new Date().getTime());
-                String sign = md5(t + config.key);
-
-                OkHttpClient okHttpClient = NetworkCompat.newClient();
-                Request request = new Request.Builder().url(NetworkCompat.buildHeartUrl(config.host, t, sign))
-                        .method("GET", null).build();''',
-'手动配置心跳')
-
-          s = replace_once(s,
-'''                if (tmp[0].indexOf("localhost") >= 0) {
-                    Toast.makeText(MainActivity.this, "配置信息错误，本机调试请访问 本机局域网IP:8080(如192.168.1.101:8080) 获取配置信息进行配置!",
-                            Toast.LENGTH_LONG).show();
-                    return;
-                }''',
-'''                if (config.host.indexOf("localhost") >= 0) {
-                    Toast.makeText(MainActivity.this, "配置信息错误，本机调试请访问 本机局域网IP:8080(如192.168.1.101:8080) 获取配置信息进行配置!",
-                            Toast.LENGTH_LONG).show();
-                    return;
-                }''',
-'localhost 检查')
-
-          s = s.replace('''                txthost.setText(" 通知地址：" + tmp[0]);
-                txtkey.setText(" 通讯密钥：" + tmp[1]);
-                host = tmp[0];
-                key = tmp[1];''', '''                txthost.setText(" 通知地址：" + config.host);
-                txtkey.setText(" 通讯密钥：" + config.key);
-                host = config.host;
-                key = config.key;''', 1)
-
-          s = replace_once(s,
-'''        OkHttpClient okHttpClient = new OkHttpClient();
-        Request request = new Request.Builder().url("http://" + host + "/appHeart?t=" + t + "&sign=" + sign)
-                .method("GET", null).build();''',
-'''        OkHttpClient okHttpClient = NetworkCompat.newClient();
-        Request request = new Request.Builder().url(NetworkCompat.buildHeartUrl(host, t, sign))
-                .method("GET", null).build();''',
-'检测心跳')
-
-          s = replace_once(s,
-'''                Toast.makeText(MainActivity.this, "心跳状态错误，请检查配置是否正确!", Toast.LENGTH_SHORT).show();''',
-'''                Toast.makeText(MainActivity.this, "心跳状态错误：" + e.getMessage(), Toast.LENGTH_SHORT).show();
-                Log.e(TAG, "检测心跳失败", e);''',
-'心跳失败提示')
-          main.write_text(s, encoding='utf-8')
-
-          s = service.read_text(encoding='utf-8')
-          if 'import com.shinian.pay.util.NetworkCompat;' not in s:
-              s = s.replace('import com.shinian.pay.ui.MainActivity;\n', 'import com.shinian.pay.ui.MainActivity;\nimport com.shinian.pay.util.NetworkCompat;\n')
-
-          s = s.replace('''            okHttpClient = new OkHttpClient.Builder()
-                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-                    .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                    .build();''', '''            okHttpClient = NetworkCompat.newClient();''')
-
-          s = s.replace('''                Request request = new Request.Builder()
-                        .url("http://" + host + "/appHeart?t=" + t + "&sign=" + sign)
-                        .method("GET", null)
-                        .build();''', '''                Request request = new Request.Builder()
-                        .url(NetworkCompat.buildHeartUrl(host, t, sign))
-                        .method("GET", null)
-                        .build();''')
-
-          s = s.replace('''        String sign = md5(type + priceStr + t + key);
-        String url = buildPushUrl(host, type, priceStr, t, sign);''', '''        String transMemo = "";
-        String sign = md5(type + priceStr + t + transMemo + key);
-        String url = buildPushUrl(host, type, priceStr, t, transMemo, sign);''')
-
-          s = replace_once(s,
-'''    private String buildPushUrl(String host, int type, String priceStr, String t, String sign) {
-        return "http://" +
-                host +
-                "/appPush?t=" +
-                t +
-                "&type=" +
-                type +
-                "&price=" +
-                priceStr +
-                "&sign=" +
-                sign;
-    }''',
-'''    private String buildPushUrl(String host, int type, String priceStr, String t, String transMemo, String sign) {
-        return NetworkCompat.buildPushUrl(host, type, priceStr, t, transMemo, sign);
-    }''',
-'buildPushUrl')
-
-          s = s.replace('''                    String sign = md5(type + priceStr + t + key);
-                    String url = buildPushUrl(host, type, priceStr, t, sign);''', '''                    String transMemo = "";
-                    String sign = md5(type + priceStr + t + transMemo + key);
-                    String url = buildPushUrl(host, type, priceStr, t, transMemo, sign);''')
-
-          service.write_text(s, encoding='utf-8')
-          print('Patch applied successfully')
+          print("Patch finished.")
           PY
 
       - name: Make Gradle executable
@@ -344,7 +103,7 @@ public final class NetworkCompat {
       - name: Build debug APK
         run: ./gradlew assembleDebug --stacktrace
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Vmq-App-zf-earc-debug-apk
