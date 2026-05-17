@@ -25,9 +25,10 @@ jobs:
         with:
           gradle-version: "8.14.4"
 
-      - name: Patch source for stable Vmq callback with system proxy
+      - name: Patch source for stable Vmq callback
+        shell: bash
         run: |
-          python3 <<'PY'
+          cat > /tmp/patch_vmq.py <<'PY'
           from pathlib import Path
 
           main_path = Path("app/src/main/java/com/shinian/pay/ui/MainActivity.java")
@@ -38,7 +39,17 @@ jobs:
           service = service_path.read_text()
           manifest = manifest_path.read_text()
 
-          # 1. 允许明文 HTTP，备用兼容；公网请求仍默认改 HTTPS
+          def replace_once(text, old, new):
+              if old in text:
+                  return text.replace(old, new, 1)
+              return text
+
+          def replace_all(text, old, new):
+              if old in text:
+                  return text.replace(old, new)
+              return text
+
+          # 1. 允许明文 HTTP，作为备用兼容；实际公网接口仍走 HTTPS
           if 'android:usesCleartextTraffic="true"' not in manifest:
               manifest = manifest.replace(
                   '<application',
@@ -47,91 +58,76 @@ jobs:
               )
 
           # 2. MainActivity 心跳改 HTTPS
-          main = main.replace(
+          main = replace_all(
+              main,
               '"http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign'
           )
-          main = main.replace(
+
+          main = replace_all(
+              main,
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
           # 3. 后台打开也改 HTTPS
-          main = main.replace(
+          main = replace_all(
+              main,
               'Uri.parse("http://" + Url)',
               'Uri.parse("https://" + Url)'
           )
 
           # 4. Service 心跳改 HTTPS
-          service = service.replace(
+          service = replace_all(
+              service,
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # 5. 收到微信/支付宝/企业微信通知时，把原始通知显示在 App 日志里
-          old_log = 'Log.d(TAG, "包名: " + pkg);'
-          new_log = '''Log.d(TAG, "收到通知 包名:" + pkg + " 标题:" + title + " 内容:" + content);
-                  if (PACKAGE_ALIPAY.equals(pkg) || PACKAGE_WECHAT.equals(pkg) || PACKAGE_WECHAT_WORK.equals(pkg)) {
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                          sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
-                                  + "\\r\\r\\r\\r" + "收到原始通知 | 包名：" + pkg + " | 标题：" + title + " | 内容：" + content);
-                      }
-                  }'''
-          if old_log in service:
-              service = service.replace(old_log, new_log, 1)
-
-          # 6. 放宽金额提取：不再强制必须包含“收款”
-          service = service.replace(
-              '''int shoukuanIndex = content.indexOf("收款");
-          if (shoukuanIndex < 0) return null;
-
-          String afterShoukuan = content.substring(shoukuanIndex);''',
-              '''String afterShoukuan = content;'''
-          )
-
-          # 7. 放宽支付宝通知识别
-          old_alipay = '''boolean isNormalPay = (title.contains("成功收款") && content.contains("已转入余额")) 
-                             || content.contains("通过扫码向你付款");
-        boolean isStaffPay = title.contains("店员通") || content.contains("支付宝成功收款");'''
-
-          new_alipay = '''String rawTextAlipay = (title == null ? "" : title) + " " + (content == null ? "" : content);
-        boolean isNormalPay = rawTextAlipay.contains("成功收款") || rawTextAlipay.contains("收款") || rawTextAlipay.contains("到账") || rawTextAlipay.contains("付款") || rawTextAlipay.contains("转账") || rawTextAlipay.contains("已转入") || rawTextAlipay.contains("扫码");
-        boolean isStaffPay = rawTextAlipay.contains("店员通") || rawTextAlipay.contains("支付宝成功收款");'''
-
-          if old_alipay in service:
-              service = service.replace(old_alipay, new_alipay, 1)
-
-          # 8. 放宽微信通知识别
-          service = service.replace(
-              'if (!isPayTitle) return;',
-              '''String rawTextWechat = (title == null ? "" : title) + " " + (content == null ? "" : content);
-        if (!isPayTitle && !rawTextWechat.contains("收款") && !rawTextWechat.contains("到账") && !rawTextWechat.contains("付款") && !rawTextWechat.contains("转账") && !rawTextWechat.contains("收钱")) return;'''
-          )
-
-          service = service.replace(
-              'if (!content.contains("收款") || content.contains("已支付")) return;',
-              '''if (!(rawTextWechat.contains("收款") || rawTextWechat.contains("到账") || rawTextWechat.contains("付款") || rawTextWechat.contains("转账") || rawTextWechat.contains("收钱")) || rawTextWechat.contains("已支付")) return;'''
-          )
-
-          # 9. appPush 回调改 HTTPS，但保持原版参数：type、price、t、sign
-          # 不传 transMemo，避免你的 PHP 服务端把 transMemo 当订单 id 查询
-          service = service.replace(
+          # 5. appPush 改 HTTPS，但保留原版参数：type、price、t、sign
+          # 不传 transMemo，避免 PHP 服务端把 transMemo 当 pay_order.id 查询
+          service = replace_all(
+              service,
               'return "http://" +\n                host +',
               'return "https://" +\n                host +'
           )
 
-          # 10. 回调响应写入 App 日志，方便判断网站返回什么
-          service = service.replace(
-              '''String str = response.body().string();
-                    JSONObject result = new JSONObject(str);''',
-              '''String str = response.body().string();
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
-                                + "\\r\\r\\r\\r" + "回调URL：" + url + " | HTTP：" + response.code() + " | 返回：" + str);
-                    }
-                    JSONObject result = new JSONObject(str);''',
-              1
+          # 6. 收到微信/支付宝/企业微信通知时，把原始通知显示在 App 日志里
+          old_log = 'Log.d(TAG, "包名: " + pkg);'
+          new_log = (
+              'Log.d(TAG, "收到通知 包名:" + pkg + " 标题:" + title + " 内容:" + content);\\n'
+              '        if (PACKAGE_ALIPAY.equals(pkg) || PACKAGE_WECHAT.equals(pkg) || PACKAGE_WECHAT_WORK.equals(pkg)) {\\n'
+              '            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {\\n'
+              '                sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())\\n'
+              '                        + "\\\\r\\\\r\\\\r\\\\r" + "收到原始通知 | 包名：" + pkg + " | 标题：" + title + " | 内容：" + content);\\n'
+              '            }\\n'
+              '        }'
           )
+          service = replace_once(service, old_log, new_log)
+
+          # 7. 放宽金额识别：不再强制必须包含“收款”
+          old_money = (
+              'int shoukuanIndex = content.indexOf("收款");\\n'
+              '        if (shoukuanIndex < 0) return null;\\n\\n'
+              '        String afterShoukuan = content.substring(shoukuanIndex);'
+          )
+          new_money = 'String afterShoukuan = content;'
+          service = replace_once(service, old_money, new_money)
+
+          # 8. 回调响应写入 App 日志，方便确认服务端返回内容
+          old_resp = (
+              'String str = response.body().string();\\n'
+              '                    JSONObject result = new JSONObject(str);'
+          )
+          new_resp = (
+              'String str = response.body().string();\\n'
+              '                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {\\n'
+              '                        sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())\\n'
+              '                                + "\\\\r\\\\r\\\\r\\\\r" + "回调URL：" + url + " | HTTP：" + response.code() + " | 返回：" + str);\\n'
+              '                    }\\n'
+              '                    JSONObject result = new JSONObject(str);'
+          )
+          service = replace_once(service, old_resp, new_resp)
 
           main_path.write_text(main)
           service_path.write_text(service)
@@ -139,6 +135,8 @@ jobs:
 
           print("Patch finished: HTTPS appHeart/appPush, system proxy enabled, no transMemo.")
           PY
+
+          python3 /tmp/patch_vmq.py
 
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
