@@ -25,7 +25,7 @@ jobs:
         with:
           gradle-version: "8.14.4"
 
-      - name: Patch only callback URL
+      - name: Patch Vmq App for zf.earc.top
         shell: bash
         run: |
           python3 <<'PY'
@@ -39,7 +39,32 @@ jobs:
           service = service_path.read_text()
           manifest = manifest_path.read_text()
 
-          # 允许 HTTP，作为备用兼容；但 zf.earc.top 默认走 HTTPS
+          def replace_method(src, signature, new_method):
+              start = src.find(signature)
+              if start == -1:
+                  raise SystemExit("找不到方法：" + signature)
+
+              brace_start = src.find("{", start)
+              if brace_start == -1:
+                  raise SystemExit("找不到方法左括号：" + signature)
+
+              depth = 0
+              end = None
+              for i in range(brace_start, len(src)):
+                  if src[i] == "{":
+                      depth += 1
+                  elif src[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = i + 1
+                          break
+
+              if end is None:
+                  raise SystemExit("找不到方法右括号：" + signature)
+
+              return src[:start] + new_method + src[end:]
+
+          # 允许 HTTP 备用；zf.earc.top 默认改 HTTPS
           if 'android:usesCleartextTraffic="true"' not in manifest:
               manifest = manifest.replace(
                   '<application',
@@ -47,37 +72,33 @@ jobs:
                   1
               )
 
-          # 1. 心跳 appHeart 改 HTTPS
+          # 心跳 appHeart 改 HTTPS
           main = main.replace(
               '"http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign'
           )
-
           main = main.replace(
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
-
           service = service.replace(
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # 2. 后台打开改 HTTPS
+          # 后台打开改 HTTPS
           main = main.replace(
               'Uri.parse("http://" + Url)',
               'Uri.parse("https://" + Url)'
           )
 
-          # 3. 到账回调 appPush 改 HTTPS
-          # 保持 shinian-a/Vmq-App 原版参数：t、type、price、sign
-          # 不传 transMemo，不改识别逻辑，不禁用系统代理
+          # appPush 回调改 HTTPS；保持原版参数：t、type、price、sign
           service = service.replace(
               'return "http://" +\n                host +',
               'return "https://" +\n                host +'
           )
 
-          # 4. 如果之前某版残留 transMemo，这里还原成原版调用
+          # 如果之前残留 transMemo，强制还原
           service = service.replace(
               'appPush(platformType, amount, title + " " + content);',
               'appPush(platformType, amount);'
@@ -89,6 +110,10 @@ jobs:
           service = service.replace(
               'public void appPush(final int type, final double price, final String transMemo) {',
               'public void appPush(final int type, final double price) {'
+          )
+          service = service.replace(
+              'String memo = transMemo == null ? "" : transMemo;',
+              ''
           )
           service = service.replace(
               'String sign = md5(type + priceStr + t + memo + key);',
@@ -107,33 +132,215 @@ jobs:
               'private void scheduleRetryCallback(final int type, final double price, final String priceStr) {'
           )
 
-          # 5. 不使用 Proxy.NO_PROXY，允许走手机系统代理/VPN
-          service = service.replace(
-              '.proxy(Proxy.NO_PROXY)\n                    ',
-              ''
+          # 不禁用系统代理/VPN
+          service = service.replace('.proxy(Proxy.NO_PROXY)\n                    ', '')
+          main = main.replace('.proxy(Proxy.NO_PROXY)', '')
+          service = service.replace('import java.net.Proxy;\n', '')
+          main = main.replace('import java.net.Proxy;\n', '')
+          service = service.replace('url.openConnection(Proxy.NO_PROXY)', 'url.openConnection()')
+
+          # 收到支付宝/微信通知，先输出原始日志
+          old_log = 'Log.d(TAG, "包名: " + pkg);'
+          new_log = '''Log.d(TAG, "收到通知 包名:" + pkg + " 标题:" + title + " 内容:" + content);
+                  if (PACKAGE_ALIPAY.equals(pkg) || PACKAGE_WECHAT.equals(pkg) || PACKAGE_WECHAT_WORK.equals(pkg)) {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                          sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                  + "\\r\\r\\r\\r" + "收到原始通知 | 包名：" + pkg + " | 标题：" + title + " | 内容：" + content);
+                      }
+                  }'''
+          if old_log in service:
+              service = service.replace(old_log, new_log, 1)
+
+          # 金额识别：支付宝/微信都从整段文字里找金额
+          new_get_money = '''public static String getMoney(String content) {
+                  if (content == null || content.isEmpty()) return null;
+
+                  java.util.regex.Matcher matcher = MONEY_PATTERN.matcher(content);
+
+                  while (matcher.find()) {
+                      String matched = matcher.group();
+                      if (isValidNumber(matched)) {
+                          try {
+                              double amount = Double.parseDouble(matched);
+                              if (amount >= 0.01 && amount <= 999999.99) {
+                                  return matched;
+                              }
+                          } catch (NumberFormatException e) {
+                              Log.w(TAG, "getMoney: 匹配到无效金额：" + matched);
+                          }
+                      }
+                  }
+
+                  return null;
+              }'''
+          service = replace_method(
+              service,
+              'public static String getMoney(String content) {',
+              new_get_money
           )
-          main = main.replace(
-              '.proxy(Proxy.NO_PROXY)',
-              ''
+
+          # 支付宝识别：适配“你已成功收款1.00元”“余额宝”“老顾客消费”等
+          new_alipay = '''private void handleAlipayNotification(String title, String content) {
+                  if (TextUtils.isEmpty(title) && TextUtils.isEmpty(content)) {
+                      return;
+                  }
+
+                  String rawText = (title == null ? "" : title) + " " + (content == null ? "" : content);
+
+                  boolean isAlipayPay =
+                          rawText.contains("成功收款") ||
+                          rawText.contains("收款") ||
+                          rawText.contains("到账") ||
+                          rawText.contains("付款") ||
+                          rawText.contains("转账") ||
+                          rawText.contains("已转入") ||
+                          rawText.contains("余额宝") ||
+                          rawText.contains("通过扫码向你付款") ||
+                          rawText.contains("店员通") ||
+                          rawText.contains("支付宝成功收款") ||
+                          rawText.contains("老顾客消费");
+
+                  if (!isAlipayPay) {
+                      return;
+                  }
+
+                  String money = getMoney(title);
+                  if (money == null || money.isEmpty()) {
+                      money = getMoney(content);
+                  }
+
+                  if (money != null && !money.isEmpty()) {
+                      try {
+                          double amount = Double.parseDouble(money);
+                          Toast.makeText(this, "匹配成功：支付宝到账" + money + "元", Toast.LENGTH_LONG).show();
+                          Log.d(TAG, "onAccessibilityEvent: 匹配成功：支付宝到账 " + money + "元");
+
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                              sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                      + "\\r\\r\\r\\r"
+                                      + "匹配支付宝收款成功 | 金额：" + money
+                                      + " | 标题：" + title
+                                      + " | 内容：" + content);
+                          }
+
+                          appPush(2, amount);
+                      } catch (NumberFormatException e) {
+                          Log.e(TAG, "解析支付宝金额失败：" + money, e);
+                          showMoneyParseErrorToast("支付宝");
+                      }
+                  } else {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                          sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                  + "\\r\\r\\r\\r"
+                                  + "收到支付宝通知，但未识别到金额 | 标题：" + title
+                                  + " | 内容：" + content);
+                      }
+                      showMoneyParseErrorToast("支付宝");
+                  }
+              }'''
+          service = replace_method(
+              service,
+              'private void handleAlipayNotification(String title, String content) {',
+              new_alipay
           )
-          service = service.replace(
-              'import java.net.Proxy;\n',
-              ''
+
+          # 微信识别：兼容微信支付、微信收款助手、二维码收款、收款到账、转账到账等
+          new_wechat = '''private void handleWechatNotification(String title, String content) {
+                  if (TextUtils.isEmpty(title) && TextUtils.isEmpty(content)) return;
+
+                  String rawText = (title == null ? "" : title) + " " + (content == null ? "" : content);
+
+                  boolean isPayTitle = false;
+                  for (String payTitle : WECHAT_PAY_TITLES) {
+                      if (payTitle.equals(title) || rawText.contains(payTitle)) {
+                          isPayTitle = true;
+                          break;
+                      }
+                  }
+
+                  boolean isWechatPay =
+                          isPayTitle ||
+                          rawText.contains("微信支付") ||
+                          rawText.contains("微信收款") ||
+                          rawText.contains("收款助手") ||
+                          rawText.contains("二维码收款") ||
+                          rawText.contains("收款到账") ||
+                          rawText.contains("到账") ||
+                          rawText.contains("收款") ||
+                          rawText.contains("转账");
+
+                  if (!isWechatPay) {
+                      return;
+                  }
+
+                  if (rawText.contains("已支付") || rawText.contains("付款成功")) {
+                      return;
+                  }
+
+                  String money = getMoney(content);
+                  if (money == null || money.isEmpty()) {
+                      money = getMoney(title);
+                  }
+
+                  if (money != null && !money.isEmpty()) {
+                      try {
+                          double amount = Double.parseDouble(money);
+                          Toast.makeText(this, "匹配成功：微信到账" + money + "元", Toast.LENGTH_LONG).show();
+                          Log.d(TAG, "onAccessibilityEvent: 匹配成功：微信到账 " + money + "元");
+
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                              sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                      + "\\r\\r\\r\\r"
+                                      + "匹配微信收款成功 | 金额：" + money
+                                      + " | 标题：" + title
+                                      + " | 内容：" + content);
+                          }
+
+                          appPush(1, amount);
+                      } catch (NumberFormatException e) {
+                          Log.e(TAG, "解析微信金额失败：" + money, e);
+                          showMoneyParseErrorToast("微信");
+                      }
+                  } else {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                          sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                  + "\\r\\r\\r\\r"
+                                  + "收到微信通知，但未识别到金额 | 标题：" + title
+                                  + " | 内容：" + content);
+                      }
+                      showMoneyParseErrorToast("微信");
+                  }
+              }'''
+          service = replace_method(
+              service,
+              'private void handleWechatNotification(String title, String content) {',
+              new_wechat
           )
-          main = main.replace(
-              'import java.net.Proxy;\n',
-              ''
-          )
-          service = service.replace(
-              'url.openConnection(Proxy.NO_PROXY)',
-              'url.openConnection()'
+
+          # 强制 buildPushUrl 为 HTTPS，不带 transMemo
+          new_build_url = '''private String buildPushUrl(String host, int type, String priceStr, String t, String sign) {
+                  return "https://" +
+                          host +
+                          "/appPush?t=" +
+                          t +
+                          "&type=" +
+                          type +
+                          "&price=" +
+                          priceStr +
+                          "&sign=" +
+                          sign;
+              }'''
+          service = replace_method(
+              service,
+              'private String buildPushUrl(String host, int type, String priceStr, String t, String sign) {',
+              new_build_url
           )
 
           main_path.write_text(main)
           service_path.write_text(service)
           manifest_path.write_text(manifest)
 
-          print("Patch finished: keep original recognition, only change callback to HTTPS, no transMemo, system proxy enabled.")
+          print("Patch finished: Alipay/Wechat recognition logs + HTTPS appPush + no transMemo + system proxy enabled.")
           PY
 
       - name: Build debug APK
