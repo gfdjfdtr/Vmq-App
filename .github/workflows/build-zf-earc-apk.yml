@@ -20,6 +20,11 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.4"
+
       - name: Patch source for zf.earc.top
         run: |
           python3 <<'PY'
@@ -27,31 +32,41 @@ jobs:
 
           main_path = Path("app/src/main/java/com/shinian/pay/ui/MainActivity.java")
           service_path = Path("app/src/main/java/com/shinian/pay/service/PayNotificationListenerService.java")
+          manifest_path = Path("app/src/main/AndroidManifest.xml")
 
           main = main_path.read_text()
           service = service_path.read_text()
+          manifest = manifest_path.read_text()
 
-          # 给 MainActivity 增加 Proxy 导入
+          # 1. AndroidManifest 保留/确保允许明文 HTTP，兼容局域网/备用接口
+          if 'android:usesCleartextTraffic="true"' not in manifest:
+              manifest = manifest.replace(
+                  '<application',
+                  '<application\n            android:usesCleartextTraffic="true"',
+                  1
+              )
+
+          # 2. MainActivity 增加 Proxy 导入
           if "import java.net.Proxy;" not in main:
               main = main.replace(
                   "import java.net.HttpURLConnection;",
                   "import java.net.HttpURLConnection;\nimport java.net.Proxy;"
               )
 
-          # 给 PayNotificationListenerService 增加 Proxy 导入
+          # 3. PayNotificationListenerService 增加 Proxy 导入
           if "import java.net.Proxy;" not in service:
               service = service.replace(
                   "import java.net.HttpURLConnection;",
                   "import java.net.HttpURLConnection;\nimport java.net.Proxy;"
               )
 
-          # MainActivity：OkHttpClient 改为不走系统代理
+          # 4. MainActivity 里 OkHttpClient 不走系统代理，避免 CONNECT / 异常
           main = main.replace(
               "OkHttpClient okHttpClient = new OkHttpClient();",
               "OkHttpClient okHttpClient = new OkHttpClient.Builder().proxy(Proxy.NO_PROXY).build();"
           )
 
-          # MainActivity：心跳地址改为 https
+          # 5. MainActivity 心跳接口改为 HTTPS
           main = main.replace(
               '"http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign'
@@ -62,46 +77,41 @@ jobs:
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # Service：OkHttpClient 改为不走系统代理
+          # 6. Service 里的 OkHttpClient 增加不走系统代理
           service = service.replace(
-              ".connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)",
-              ".proxy(Proxy.NO_PROXY)\n                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)"
+              "new OkHttpClient.Builder()\n                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)",
+              "new OkHttpClient.Builder()\n                    .proxy(Proxy.NO_PROXY)\n                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)"
           )
 
-          # Service：心跳地址改为 https
+          # 7. Service 心跳接口改为 HTTPS
           service = service.replace(
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # Service：appPush 地址改为 https
+          # 8. Service appPush 回调地址改为 HTTPS
           service = service.replace(
               'return "http://" +\n                host +',
               'return "https://" +\n                host +'
           )
 
-          # Service：你的服务端 appPush 签名规则需要 transMemo，这里先兼容空字符串
+          # 9. appPush 签名适配你的服务端规则：
+          # sign = md5(type + price + t + transMemo + key)
+          # 这里 transMemo 默认空字符串，与你当前服务端兼容
           service = service.replace(
               "String sign = md5(type + priceStr + t + key);",
               "String transMemo = \"\";\n        String sign = md5(type + priceStr + t + transMemo + key);"
           )
 
-          service = service.replace(
-              "String sign = md5(type + priceStr + t + key);",
-              "String transMemo = \"\";\n                    String sign = md5(type + priceStr + t + transMemo + key);"
-          )
-
           main_path.write_text(main)
           service_path.write_text(service)
+          manifest_path.write_text(manifest)
 
           print("Patch finished.")
           PY
 
-      - name: Make Gradle executable
-        run: chmod +x ./gradlew
-
       - name: Build debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
