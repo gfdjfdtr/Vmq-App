@@ -64,7 +64,7 @@ jobs:
 
               return src[:start] + new_method + src[end:]
 
-          # 允许 HTTP 备用；zf.earc.top 默认改 HTTPS
+          # 允许 HTTP 备用；zf.earc.top 默认 HTTPS
           if 'android:usesCleartextTraffic="true"' not in manifest:
               manifest = manifest.replace(
                   '<application',
@@ -72,7 +72,7 @@ jobs:
                   1
               )
 
-          # 心跳 appHeart 改 HTTPS
+          # appHeart 改 HTTPS
           main = main.replace(
               '"http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign'
@@ -92,54 +92,22 @@ jobs:
               'Uri.parse("https://" + Url)'
           )
 
-          # appPush 回调改 HTTPS；保持原版参数：t、type、price、sign
-          service = service.replace(
-              'return "http://" +\n                host +',
-              'return "https://" +\n                host +'
-          )
-
-          # 如果之前残留 transMemo，强制还原
-          service = service.replace(
-              'appPush(platformType, amount, title + " " + content);',
-              'appPush(platformType, amount);'
-          )
-          service = service.replace(
-              'appPush(1, amount, title + " " + content);',
-              'appPush(1, amount);'
-          )
-          service = service.replace(
-              'public void appPush(final int type, final double price, final String transMemo) {',
-              'public void appPush(final int type, final double price) {'
-          )
-          service = service.replace(
-              'String memo = transMemo == null ? "" : transMemo;',
-              ''
-          )
-          service = service.replace(
-              'String sign = md5(type + priceStr + t + memo + key);',
-              'String sign = md5(type + priceStr + t + key);'
-          )
-          service = service.replace(
-              'String url = buildPushUrl(host, type, priceStr, t, memo, sign);',
-              'String url = buildPushUrl(host, type, priceStr, t, sign);'
-          )
-          service = service.replace(
-              'scheduleRetryCallback(type, price, priceStr, memo);',
-              'scheduleRetryCallback(type, price, priceStr);'
-          )
-          service = service.replace(
-              'private void scheduleRetryCallback(final int type, final double price, final String priceStr, final String memo) {',
-              'private void scheduleRetryCallback(final int type, final double price, final String priceStr) {'
-          )
-
-          # 不禁用系统代理/VPN
+          # 清理旧补丁残留：不传 transMemo，不禁用系统代理
+          service = service.replace('appPush(platformType, amount, title + " " + content);', 'appPush(platformType, amount);')
+          service = service.replace('appPush(1, amount, title + " " + content);', 'appPush(1, amount);')
+          service = service.replace('public void appPush(final int type, final double price, final String transMemo) {', 'public void appPush(final int type, final double price) {')
+          service = service.replace('String memo = transMemo == null ? "" : transMemo;', '')
+          service = service.replace('String sign = md5(type + priceStr + t + memo + key);', 'String sign = md5(type + priceStr + t + key);')
+          service = service.replace('String url = buildPushUrl(host, type, priceStr, t, memo, sign);', 'String url = buildPushUrl(host, type, priceStr, t, sign);')
+          service = service.replace('scheduleRetryCallback(type, price, priceStr, memo);', 'scheduleRetryCallback(type, price, priceStr);')
+          service = service.replace('private void scheduleRetryCallback(final int type, final double price, final String priceStr, final String memo) {', 'private void scheduleRetryCallback(final int type, final double price, final String priceStr) {')
           service = service.replace('.proxy(Proxy.NO_PROXY)\n                    ', '')
           main = main.replace('.proxy(Proxy.NO_PROXY)', '')
           service = service.replace('import java.net.Proxy;\n', '')
           main = main.replace('import java.net.Proxy;\n', '')
           service = service.replace('url.openConnection(Proxy.NO_PROXY)', 'url.openConnection()')
 
-          # 收到支付宝/微信通知，先输出原始日志
+          # 原始通知日志
           old_log = 'Log.d(TAG, "包名: " + pkg);'
           new_log = '''Log.d(TAG, "收到通知 包名:" + pkg + " 标题:" + title + " 内容:" + content);
                   if (PACKAGE_ALIPAY.equals(pkg) || PACKAGE_WECHAT.equals(pkg) || PACKAGE_WECHAT_WORK.equals(pkg)) {
@@ -151,14 +119,21 @@ jobs:
           if old_log in service:
               service = service.replace(old_log, new_log, 1)
 
-          # 金额识别：支付宝/微信都从整段文字里找金额
+          # 金额识别：只识别 数字+元 / ￥数字 / ¥数字，避免 [2条] 被识别为金额
           new_get_money = '''public static String getMoney(String content) {
                   if (content == null || content.isEmpty()) return null;
 
-                  java.util.regex.Matcher matcher = MONEY_PATTERN.matcher(content);
+                  String text = content
+                          .replace("，", ",")
+                          .replace("。", ".")
+                          .replace("（", "(")
+                          .replace("）", ")");
 
+                  java.util.regex.Pattern yuanAfter =
+                          java.util.regex.Pattern.compile("(?<![0-9])([0-9]+(?:\\\\.[0-9]{1,2})?)\\\\s*元");
+                  java.util.regex.Matcher matcher = yuanAfter.matcher(text);
                   while (matcher.find()) {
-                      String matched = matcher.group();
+                      String matched = matcher.group(1);
                       if (isValidNumber(matched)) {
                           try {
                               double amount = Double.parseDouble(matched);
@@ -166,20 +141,33 @@ jobs:
                                   return matched;
                               }
                           } catch (NumberFormatException e) {
-                              Log.w(TAG, "getMoney: 匹配到无效金额：" + matched);
+                              Log.w(TAG, "getMoney: 无效金额：" + matched);
+                          }
+                      }
+                  }
+
+                  java.util.regex.Pattern moneySymbol =
+                          java.util.regex.Pattern.compile("[¥￥]\\\\s*([0-9]+(?:\\\\.[0-9]{1,2})?)");
+                  matcher = moneySymbol.matcher(text);
+                  while (matcher.find()) {
+                      String matched = matcher.group(1);
+                      if (isValidNumber(matched)) {
+                          try {
+                              double amount = Double.parseDouble(matched);
+                              if (amount >= 0.01 && amount <= 999999.99) {
+                                  return matched;
+                              }
+                          } catch (NumberFormatException e) {
+                              Log.w(TAG, "getMoney: 无效金额：" + matched);
                           }
                       }
                   }
 
                   return null;
               }'''
-          service = replace_method(
-              service,
-              'public static String getMoney(String content) {',
-              new_get_money
-          )
+          service = replace_method(service, 'public static String getMoney(String content) {', new_get_money)
 
-          # 支付宝识别：适配“你已成功收款1.00元”“余额宝”“老顾客消费”等
+          # 支付宝识别：先确认是支付宝收款通知，再识别 数字+元
           new_alipay = '''private void handleAlipayNotification(String title, String content) {
                   if (TextUtils.isEmpty(title) && TextUtils.isEmpty(content)) {
                       return;
@@ -189,18 +177,24 @@ jobs:
 
                   boolean isAlipayPay =
                           rawText.contains("成功收款") ||
-                          rawText.contains("收款") ||
-                          rawText.contains("到账") ||
-                          rawText.contains("付款") ||
-                          rawText.contains("转账") ||
-                          rawText.contains("已转入") ||
-                          rawText.contains("余额宝") ||
+                          rawText.contains("支付宝成功收款") ||
                           rawText.contains("通过扫码向你付款") ||
                           rawText.contains("店员通") ||
-                          rawText.contains("支付宝成功收款") ||
-                          rawText.contains("老顾客消费");
+                          rawText.contains("收钱码到账") ||
+                          rawText.contains("收款到账") ||
+                          rawText.contains("老顾客消费") ||
+                          rawText.contains("已转入余额") ||
+                          rawText.contains("余额宝");
 
                   if (!isAlipayPay) {
+                      return;
+                  }
+
+                  if (rawText.contains("退款") ||
+                      rawText.contains("失败") ||
+                      rawText.contains("广告") ||
+                      rawText.contains("活动提醒") ||
+                      rawText.contains("申请提醒")) {
                       return;
                   }
 
@@ -213,7 +207,6 @@ jobs:
                       try {
                           double amount = Double.parseDouble(money);
                           Toast.makeText(this, "匹配成功：支付宝到账" + money + "元", Toast.LENGTH_LONG).show();
-                          Log.d(TAG, "onAccessibilityEvent: 匹配成功：支付宝到账 " + money + "元");
 
                           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                               sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
@@ -232,48 +225,52 @@ jobs:
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                           sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
                                   + "\\r\\r\\r\\r"
-                                  + "收到支付宝通知，但未识别到金额 | 标题：" + title
+                                  + "收到支付宝收款通知，但未识别到金额 | 标题：" + title
                                   + " | 内容：" + content);
                       }
                       showMoneyParseErrorToast("支付宝");
                   }
               }'''
-          service = replace_method(
-              service,
-              'private void handleAlipayNotification(String title, String content) {',
-              new_alipay
-          )
+          service = replace_method(service, 'private void handleAlipayNotification(String title, String content) {', new_alipay)
 
-          # 微信识别：兼容微信支付、微信收款助手、二维码收款、收款到账、转账到账等
+          # 微信识别：必须先确认是微信收款助手/微信支付收款类通知，避免好友消息误判
           new_wechat = '''private void handleWechatNotification(String title, String content) {
                   if (TextUtils.isEmpty(title) && TextUtils.isEmpty(content)) return;
 
                   String rawText = (title == null ? "" : title) + " " + (content == null ? "" : content);
 
-                  boolean isPayTitle = false;
+                  boolean fromWechatPayAssistant = false;
                   for (String payTitle : WECHAT_PAY_TITLES) {
                       if (payTitle.equals(title) || rawText.contains(payTitle)) {
-                          isPayTitle = true;
+                          fromWechatPayAssistant = true;
                           break;
                       }
                   }
 
-                  boolean isWechatPay =
-                          isPayTitle ||
-                          rawText.contains("微信支付") ||
-                          rawText.contains("微信收款") ||
-                          rawText.contains("收款助手") ||
-                          rawText.contains("二维码收款") ||
-                          rawText.contains("收款到账") ||
-                          rawText.contains("到账") ||
-                          rawText.contains("收款") ||
-                          rawText.contains("转账");
+                  if (!fromWechatPayAssistant) {
+                      fromWechatPayAssistant =
+                              "微信收款助手".equals(title) ||
+                              "微信支付".equals(title) ||
+                              rawText.contains("微信收款助手：") ||
+                              rawText.contains("微信支付收款") ||
+                              rawText.contains("微信收款商业版") ||
+                              rawText.contains("二维码收款") ||
+                              rawText.contains("收款到账");
+                  }
 
-                  if (!isWechatPay) {
+                  if (!fromWechatPayAssistant) {
                       return;
                   }
 
-                  if (rawText.contains("已支付") || rawText.contains("付款成功")) {
+                  if (rawText.contains("已支付") ||
+                      rawText.contains("付款成功") ||
+                      rawText.contains("收款失败") ||
+                      rawText.contains("失败通知") ||
+                      rawText.contains("申请提醒") ||
+                      rawText.contains("收款码牌") ||
+                      rawText.contains("码牌套包") ||
+                      rawText.contains("朋友消息") ||
+                      rawText.contains("群聊")) {
                       return;
                   }
 
@@ -286,7 +283,6 @@ jobs:
                       try {
                           double amount = Double.parseDouble(money);
                           Toast.makeText(this, "匹配成功：微信到账" + money + "元", Toast.LENGTH_LONG).show();
-                          Log.d(TAG, "onAccessibilityEvent: 匹配成功：微信到账 " + money + "元");
 
                           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                               sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
@@ -305,19 +301,15 @@ jobs:
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                           sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
                                   + "\\r\\r\\r\\r"
-                                  + "收到微信通知，但未识别到金额 | 标题：" + title
+                                  + "收到微信收款通知，但未识别到金额 | 标题：" + title
                                   + " | 内容：" + content);
                       }
                       showMoneyParseErrorToast("微信");
                   }
               }'''
-          service = replace_method(
-              service,
-              'private void handleWechatNotification(String title, String content) {',
-              new_wechat
-          )
+          service = replace_method(service, 'private void handleWechatNotification(String title, String content) {', new_wechat)
 
-          # 强制 buildPushUrl 为 HTTPS，不带 transMemo
+          # 强制 appPush HTTPS，不带 transMemo
           new_build_url = '''private String buildPushUrl(String host, int type, String priceStr, String t, String sign) {
                   return "https://" +
                           host +
@@ -330,17 +322,13 @@ jobs:
                           "&sign=" +
                           sign;
               }'''
-          service = replace_method(
-              service,
-              'private String buildPushUrl(String host, int type, String priceStr, String t, String sign) {',
-              new_build_url
-          )
+          service = replace_method(service, 'private String buildPushUrl(String host, int type, String priceStr, String t, String sign) {', new_build_url)
 
           main_path.write_text(main)
           service_path.write_text(service)
           manifest_path.write_text(manifest)
 
-          print("Patch finished: Alipay/Wechat recognition logs + HTTPS appPush + no transMemo + system proxy enabled.")
+          print("Patch finished: safer WeChat/Alipay recognition, amount+元 only, HTTPS appPush, no transMemo.")
           PY
 
       - name: Build debug APK
