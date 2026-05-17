@@ -25,10 +25,11 @@ jobs:
         with:
           gradle-version: "8.14.4"
 
-      - name: Patch source for zf.earc.top
+      - name: Patch source for zf.earc.top and notification debug
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           main_path = Path("app/src/main/java/com/shinian/pay/ui/MainActivity.java")
           service_path = Path("app/src/main/java/com/shinian/pay/service/PayNotificationListenerService.java")
@@ -38,7 +39,7 @@ jobs:
           service = service_path.read_text()
           manifest = manifest_path.read_text()
 
-          # 1. AndroidManifest 保留/确保允许明文 HTTP，兼容局域网/备用接口
+          # 1. AndroidManifest 确保允许明文 HTTP，备用兼容
           if 'android:usesCleartextTraffic="true"' not in manifest:
               manifest = manifest.replace(
                   '<application',
@@ -53,61 +54,308 @@ jobs:
                   "import java.net.HttpURLConnection;\nimport java.net.Proxy;"
               )
 
-          # 3. PayNotificationListenerService 增加 Proxy 导入
+          # 3. Service 增加 Proxy 导入
           if "import java.net.Proxy;" not in service:
               service = service.replace(
                   "import java.net.HttpURLConnection;",
                   "import java.net.HttpURLConnection;\nimport java.net.Proxy;"
               )
 
-          # 4. MainActivity 里 OkHttpClient 不走系统代理，避免 CONNECT / 异常
+          # 4. MainActivity 里的 OkHttpClient 不走系统代理，避免 CONNECT / 异常
           main = main.replace(
               "OkHttpClient okHttpClient = new OkHttpClient();",
               "OkHttpClient okHttpClient = new OkHttpClient.Builder().proxy(Proxy.NO_PROXY).build();"
           )
 
-          # 5. MainActivity 心跳接口改为 HTTPS
+          # 5. MainActivity 心跳接口改 HTTPS
           main = main.replace(
               '"http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign'
           )
-
           main = main.replace(
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # 6. Service 里的 OkHttpClient 增加不走系统代理
+          # 6. 后台打开也改 HTTPS
+          main = main.replace(
+              'Uri.parse("http://" + Url)',
+              'Uri.parse("https://" + Url)'
+          )
+
+          # 7. Service 里的 OkHttpClient 不走系统代理
           service = service.replace(
               "new OkHttpClient.Builder()\n                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)",
               "new OkHttpClient.Builder()\n                    .proxy(Proxy.NO_PROXY)\n                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)"
           )
 
-          # 7. Service 心跳接口改为 HTTPS
+          # 8. Service 心跳接口改 HTTPS
           service = service.replace(
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # 8. Service appPush 回调地址改为 HTTPS
-          service = service.replace(
-              'return "http://" +\n                host +',
-              'return "https://" +\n                host +'
+          # 9. 只要收到微信/支付宝/企业微信通知，就把原始通知写到 App 日志
+          old_log = 'Log.d(TAG, "包名: " + pkg);'
+          new_log = '''Log.d(TAG, "收到通知 包名:" + pkg + " 标题:" + title + " 内容:" + content);
+
+          if (PACKAGE_ALIPAY.equals(pkg) || PACKAGE_WECHAT.equals(pkg) || PACKAGE_WECHAT_WORK.equals(pkg)) {
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                  sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                          + "\\r\\r\\r\\r"
+                          + "收到原始通知："
+                          + "\\n包名：" + pkg
+                          + "\\n标题：" + title
+                          + "\\n内容：" + content);
+              }
+          }'''
+          if old_log in service:
+              service = service.replace(old_log, new_log, 1)
+
+          # 10. 放宽金额提取：不再强制必须包含“收款”
+          service = re.sub(
+              r'    public static String getMoney\(String content\) \{[\s\S]*?    \}\n    \n    /\*\*\n     \* 处理支付宝收款通知',
+              '''    public static String getMoney(String content) {
+                  if (content == null || content.isEmpty()) return null;
+
+                  java.util.regex.Pattern pattern =
+                          java.util.regex.Pattern.compile("(?<!\\\\d)(\\\\d+(?:\\\\.\\\\d{1,2})?)(?!\\\\d)");
+                  java.util.regex.Matcher matcher = pattern.matcher(content);
+
+                  while (matcher.find()) {
+                      String matched = matcher.group();
+                      if (isValidNumber(matched)) {
+                          try {
+                              double amount = Double.parseDouble(matched);
+                              if (amount >= 0.01 && amount <= 999999.99) {
+                                  return matched;
+                              }
+                          } catch (NumberFormatException e) {
+                              Log.w(TAG, "getMoney: 无效金额：" + matched);
+                          }
+                      }
+                  }
+                  return null;
+              }
+              
+              /**
+               * 处理支付宝收款通知''',
+              service,
+              count=1
           )
 
-          # 9. appPush 签名适配你的服务端规则：
-          # sign = md5(type + price + t + transMemo + key)
-          # 这里 transMemo 默认空字符串，与你当前服务端兼容
+          # 11. 替换支付宝识别逻辑：更宽松，并记录失败原因
+          service = re.sub(
+              r'    private void handleAlipayNotification\(String title, String content\) \{[\s\S]*?    \}\n    \n    /\*\*\n     \* 处理自检测试通知',
+              '''    private void handleAlipayNotification(String title, String content) {
+                  if (TextUtils.isEmpty(title) && TextUtils.isEmpty(content)) {
+                      return;
+                  }
+
+                  String raw = (title == null ? "" : title) + " " + (content == null ? "" : content);
+
+                  boolean likelyPay =
+                          raw.contains("收款") ||
+                          raw.contains("到账") ||
+                          raw.contains("付款") ||
+                          raw.contains("转账") ||
+                          raw.contains("已转入") ||
+                          raw.contains("扫码") ||
+                          raw.contains("店员通") ||
+                          raw.contains("支付宝");
+
+                  if (!likelyPay) {
+                      return;
+                  }
+
+                  String money = getMoney(title);
+                  if (money == null || money.isEmpty()) {
+                      money = getMoney(content);
+                  }
+
+                  if (money != null && !money.isEmpty()) {
+                      try {
+                          double amount = Double.parseDouble(money);
+                          Toast.makeText(this, "匹配成功：支付宝到账" + money + "元", Toast.LENGTH_LONG).show();
+                          Log.d(TAG, "匹配成功：支付宝到账 " + money + " 元，原始通知：" + raw);
+
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                              sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                      + "\\r\\r\\r\\r"
+                                      + "匹配支付宝收款成功："
+                                      + "\\n金额：" + money
+                                      + "\\n标题：" + title
+                                      + "\\n内容：" + content);
+                          }
+
+                          appPush(2, amount, raw);
+                      } catch (NumberFormatException e) {
+                          Log.e(TAG, "解析支付宝金额失败：" + money, e);
+                          showMoneyParseErrorToast("支付宝");
+                      }
+                  } else {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                          sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                  + "\\r\\r\\r\\r"
+                                  + "收到支付宝通知，但没有识别到金额："
+                                  + "\\n标题：" + title
+                                  + "\\n内容：" + content);
+                      }
+                      showMoneyParseErrorToast("支付宝");
+                  }
+              }
+              
+              /**
+               * 处理自检测试通知''',
+              service,
+              count=1
+          )
+
+          # 12. 替换微信识别逻辑：更宽松，并记录失败原因
+          service = re.sub(
+              r'    private void handleWechatNotification\(String title, String content\) \{[\s\S]*?    \}\n\n    // 监听服务连接成功时回调初始化心跳线程',
+              '''    private void handleWechatNotification(String title, String content) {
+                  if (TextUtils.isEmpty(title) && TextUtils.isEmpty(content)) return;
+
+                  String raw = (title == null ? "" : title) + " " + (content == null ? "" : content);
+
+                  boolean likelyPay =
+                          raw.contains("微信支付") ||
+                          raw.contains("微信收款") ||
+                          raw.contains("收款") ||
+                          raw.contains("到账") ||
+                          raw.contains("付款") ||
+                          raw.contains("转账") ||
+                          raw.contains("二维码收款") ||
+                          raw.contains("收钱");
+
+                  if (!likelyPay) {
+                      return;
+                  }
+
+                  String money = getMoney(content);
+                  if (money == null || money.isEmpty()) {
+                      money = getMoney(title);
+                  }
+
+                  if (money != null && !money.isEmpty()) {
+                      try {
+                          double amount = Double.parseDouble(money);
+                          Toast.makeText(this, "匹配成功：微信到账" + money + "元", Toast.LENGTH_LONG).show();
+                          Log.d(TAG, "匹配成功：微信到账 " + money + " 元，原始通知：" + raw);
+
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                              sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                      + "\\r\\r\\r\\r"
+                                      + "匹配微信收款成功："
+                                      + "\\n金额：" + money
+                                      + "\\n标题：" + title
+                                      + "\\n内容：" + content);
+                          }
+
+                          appPush(1, amount, raw);
+                      } catch (NumberFormatException e) {
+                          Log.e(TAG, "解析微信金额失败：" + money, e);
+                          showMoneyParseErrorToast("微信");
+                      }
+                  } else {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                          sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+                                  + "\\r\\r\\r\\r"
+                                  + "收到微信通知，但没有识别到金额："
+                                  + "\\n标题：" + title
+                                  + "\\n内容：" + content);
+                      }
+                      showMoneyParseErrorToast("微信");
+                  }
+              }
+
+              // 监听服务连接成功时回调初始化心跳线程''',
+              service,
+              count=1
+          )
+
+          # 13. appPush 方法增加 transMemo
+          service = service.replace(
+              "public void appPush(final int type, final double price) {",
+              "public void appPush(final int type, final double price, final String transMemo) {"
+          )
+
+          service = service.replace(
+              "String priceStr = String.format(\"%.2f\", price);\n            \n        Log.d(TAG, \"appPush: 开始 - 类型:\" + type + \", 金额:\" + priceStr);",
+              "String priceStr = String.format(\"%.2f\", price);\\n        String memo = transMemo == null ? \"\" : transMemo;\\n            \\n        Log.d(TAG, \"appPush: 开始 - 类型:\" + type + \", 金额:\" + priceStr + \", 备注:\" + memo);"
+          )
+
+          # 14. appPush 签名改成 md5(type + price + t + transMemo + key)
           service = service.replace(
               "String sign = md5(type + priceStr + t + key);",
-              "String transMemo = \"\";\n        String sign = md5(type + priceStr + t + transMemo + key);"
+              "String sign = md5(type + priceStr + t + memo + key);"
+          )
+
+          service = service.replace(
+              "String url = buildPushUrl(host, type, priceStr, t, sign);",
+              "String url = buildPushUrl(host, type, priceStr, t, memo, sign);"
+          )
+
+          service = service.replace(
+              "scheduleRetryCallback(type, price, priceStr);",
+              "scheduleRetryCallback(type, price, priceStr, memo);"
+          )
+
+          # 15. 替换 buildPushUrl，增加 transMemo，并用 HTTPS
+          service = re.sub(
+              r'    private String buildPushUrl\(String host, int type, String priceStr, String t, String sign\) \{[\s\S]*?    \}\n        \n    /\*\*\n     \* 记录推送结果日志',
+              '''    private String encodeUrl(String value) {
+                  try {
+                      return java.net.URLEncoder.encode(value == null ? "" : value, "UTF-8");
+                  } catch (Exception e) {
+                      return "";
+                  }
+              }
+
+              private String buildPushUrl(String host, int type, String priceStr, String t, String transMemo, String sign) {
+                  return "https://" +
+                          host +
+                          "/appPush?t=" +
+                          t +
+                          "&type=" +
+                          type +
+                          "&price=" +
+                          priceStr +
+                          "&transMemo=" +
+                          encodeUrl(transMemo) +
+                          "&sign=" +
+                          sign;
+              }
+                  
+              /**
+               * 记录推送结果日志''',
+              service,
+              count=1
+          )
+
+          # 16. 补回调也适配 memo
+          service = service.replace(
+              "private void scheduleRetryCallback(final int type, final double price, final String priceStr) {",
+              "private void scheduleRetryCallback(final int type, final double price, final String priceStr, final String memo) {"
+          )
+
+          service = service.replace(
+              "String url = buildPushUrl(host, type, priceStr, t, sign);",
+              "String url = buildPushUrl(host, type, priceStr, t, memo, sign);"
+          )
+
+          # 17. getHtml 不走系统代理
+          service = service.replace(
+              "conn = (HttpURLConnection) url.openConnection();",
+              "conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);"
           )
 
           main_path.write_text(main)
           service_path.write_text(service)
           manifest_path.write_text(manifest)
 
-          print("Patch finished.")
+          print("Patch finished: notification debug + HTTPS appPush + transMemo sign.")
           PY
 
       - name: Build debug APK
