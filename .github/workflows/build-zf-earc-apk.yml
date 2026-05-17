@@ -25,7 +25,7 @@ jobs:
         with:
           gradle-version: "8.14.4"
 
-      - name: Patch source for stable Vmq callback
+      - name: Patch only callback URL
         shell: bash
         run: |
           python3 <<'PY'
@@ -39,7 +39,7 @@ jobs:
           service = service_path.read_text()
           manifest = manifest_path.read_text()
 
-          # 允许 HTTP，备用兼容；公网接口仍改成 HTTPS
+          # 允许 HTTP，作为备用兼容；但 zf.earc.top 默认走 HTTPS
           if 'android:usesCleartextTraffic="true"' not in manifest:
               manifest = manifest.replace(
                   '<application',
@@ -47,7 +47,7 @@ jobs:
                   1
               )
 
-          # MainActivity 心跳改 HTTPS
+          # 1. 心跳 appHeart 改 HTTPS
           main = main.replace(
               '"http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign'
@@ -58,72 +58,82 @@ jobs:
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # 后台打开改 HTTPS
-          main = main.replace(
-              'Uri.parse("http://" + Url)',
-              'Uri.parse("https://" + Url)'
-          )
-
-          # Service 心跳改 HTTPS
           service = service.replace(
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # appPush 回调改 HTTPS，保持原版参数：type、price、t、sign
+          # 2. 后台打开改 HTTPS
+          main = main.replace(
+              'Uri.parse("http://" + Url)',
+              'Uri.parse("https://" + Url)'
+          )
+
+          # 3. 到账回调 appPush 改 HTTPS
+          # 保持 shinian-a/Vmq-App 原版参数：t、type、price、sign
+          # 不传 transMemo，不改识别逻辑，不禁用系统代理
           service = service.replace(
               'return "http://" +\n                host +',
               'return "https://" +\n                host +'
           )
 
-          # 如果之前临时补丁残留了 transMemo 调用，这里尽量还原
+          # 4. 如果之前某版残留 transMemo，这里还原成原版调用
           service = service.replace(
               'appPush(platformType, amount, title + " " + content);',
               'appPush(platformType, amount);'
           )
-
           service = service.replace(
               'appPush(1, amount, title + " " + content);',
               'appPush(1, amount);'
           )
-
           service = service.replace(
               'public void appPush(final int type, final double price, final String transMemo) {',
               'public void appPush(final int type, final double price) {'
           )
-
-          # 如果残留了 transMemo 参数，去掉 URL 里的 transMemo 拼接
-          service = service.replace(
-              'String memo = transMemo == null ? "" : transMemo;',
-              ''
-          )
-
           service = service.replace(
               'String sign = md5(type + priceStr + t + memo + key);',
               'String sign = md5(type + priceStr + t + key);'
           )
-
           service = service.replace(
               'String url = buildPushUrl(host, type, priceStr, t, memo, sign);',
               'String url = buildPushUrl(host, type, priceStr, t, sign);'
           )
-
           service = service.replace(
               'scheduleRetryCallback(type, price, priceStr, memo);',
               'scheduleRetryCallback(type, price, priceStr);'
           )
-
           service = service.replace(
               'private void scheduleRetryCallback(final int type, final double price, final String priceStr, final String memo) {',
               'private void scheduleRetryCallback(final int type, final double price, final String priceStr) {'
           )
 
-          # 注意：不加 Proxy.NO_PROXY，让 App 可以跟随手机系统代理/VPN
+          # 5. 不使用 Proxy.NO_PROXY，允许走手机系统代理/VPN
+          service = service.replace(
+              '.proxy(Proxy.NO_PROXY)\n                    ',
+              ''
+          )
+          main = main.replace(
+              '.proxy(Proxy.NO_PROXY)',
+              ''
+          )
+          service = service.replace(
+              'import java.net.Proxy;\n',
+              ''
+          )
+          main = main.replace(
+              'import java.net.Proxy;\n',
+              ''
+          )
+          service = service.replace(
+              'url.openConnection(Proxy.NO_PROXY)',
+              'url.openConnection()'
+          )
+
           main_path.write_text(main)
           service_path.write_text(service)
           manifest_path.write_text(manifest)
 
-          print("Patch finished: HTTPS appHeart/appPush, system proxy enabled, no transMemo.")
+          print("Patch finished: keep original recognition, only change callback to HTTPS, no transMemo, system proxy enabled.")
           PY
 
       - name: Build debug APK
