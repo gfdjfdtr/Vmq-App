@@ -28,7 +28,7 @@ jobs:
       - name: Patch source for stable Vmq callback
         shell: bash
         run: |
-          cat > /tmp/patch_vmq.py <<'PY'
+          python3 <<'PY'
           from pathlib import Path
 
           main_path = Path("app/src/main/java/com/shinian/pay/ui/MainActivity.java")
@@ -39,17 +39,7 @@ jobs:
           service = service_path.read_text()
           manifest = manifest_path.read_text()
 
-          def replace_once(text, old, new):
-              if old in text:
-                  return text.replace(old, new, 1)
-              return text
-
-          def replace_all(text, old, new):
-              if old in text:
-                  return text.replace(old, new)
-              return text
-
-          # 1. 允许明文 HTTP，作为备用兼容；实际公网接口仍走 HTTPS
+          # 允许 HTTP，备用兼容；公网接口仍改成 HTTPS
           if 'android:usesCleartextTraffic="true"' not in manifest:
               manifest = manifest.replace(
                   '<application',
@@ -57,86 +47,84 @@ jobs:
                   1
               )
 
-          # 2. MainActivity 心跳改 HTTPS
-          main = replace_all(
-              main,
+          # MainActivity 心跳改 HTTPS
+          main = main.replace(
               '"http://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + tmp[0] + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          main = replace_all(
-              main,
+          main = main.replace(
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # 3. 后台打开也改 HTTPS
-          main = replace_all(
-              main,
+          # 后台打开改 HTTPS
+          main = main.replace(
               'Uri.parse("http://" + Url)',
               'Uri.parse("https://" + Url)'
           )
 
-          # 4. Service 心跳改 HTTPS
-          service = replace_all(
-              service,
+          # Service 心跳改 HTTPS
+          service = service.replace(
               '"http://" + host + "/appHeart?t=" + t + "&sign=" + sign',
               '"https://" + host + "/appHeart?t=" + t + "&sign=" + sign'
           )
 
-          # 5. appPush 改 HTTPS，但保留原版参数：type、price、t、sign
-          # 不传 transMemo，避免 PHP 服务端把 transMemo 当 pay_order.id 查询
-          service = replace_all(
-              service,
+          # appPush 回调改 HTTPS，保持原版参数：type、price、t、sign
+          service = service.replace(
               'return "http://" +\n                host +',
               'return "https://" +\n                host +'
           )
 
-          # 6. 收到微信/支付宝/企业微信通知时，把原始通知显示在 App 日志里
-          old_log = 'Log.d(TAG, "包名: " + pkg);'
-          new_log = (
-              'Log.d(TAG, "收到通知 包名:" + pkg + " 标题:" + title + " 内容:" + content);\\n'
-              '        if (PACKAGE_ALIPAY.equals(pkg) || PACKAGE_WECHAT.equals(pkg) || PACKAGE_WECHAT_WORK.equals(pkg)) {\\n'
-              '            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {\\n'
-              '                sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())\\n'
-              '                        + "\\\\r\\\\r\\\\r\\\\r" + "收到原始通知 | 包名：" + pkg + " | 标题：" + title + " | 内容：" + content);\\n'
-              '            }\\n'
-              '        }'
+          # 如果之前临时补丁残留了 transMemo 调用，这里尽量还原
+          service = service.replace(
+              'appPush(platformType, amount, title + " " + content);',
+              'appPush(platformType, amount);'
           )
-          service = replace_once(service, old_log, new_log)
 
-          # 7. 放宽金额识别：不再强制必须包含“收款”
-          old_money = (
-              'int shoukuanIndex = content.indexOf("收款");\\n'
-              '        if (shoukuanIndex < 0) return null;\\n\\n'
-              '        String afterShoukuan = content.substring(shoukuanIndex);'
+          service = service.replace(
+              'appPush(1, amount, title + " " + content);',
+              'appPush(1, amount);'
           )
-          new_money = 'String afterShoukuan = content;'
-          service = replace_once(service, old_money, new_money)
 
-          # 8. 回调响应写入 App 日志，方便确认服务端返回内容
-          old_resp = (
-              'String str = response.body().string();\\n'
-              '                    JSONObject result = new JSONObject(str);'
+          service = service.replace(
+              'public void appPush(final int type, final double price, final String transMemo) {',
+              'public void appPush(final int type, final double price) {'
           )
-          new_resp = (
-              'String str = response.body().string();\\n'
-              '                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {\\n'
-              '                        sendMonitorLogs(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())\\n'
-              '                                + "\\\\r\\\\r\\\\r\\\\r" + "回调URL：" + url + " | HTTP：" + response.code() + " | 返回：" + str);\\n'
-              '                    }\\n'
-              '                    JSONObject result = new JSONObject(str);'
-          )
-          service = replace_once(service, old_resp, new_resp)
 
+          # 如果残留了 transMemo 参数，去掉 URL 里的 transMemo 拼接
+          service = service.replace(
+              'String memo = transMemo == null ? "" : transMemo;',
+              ''
+          )
+
+          service = service.replace(
+              'String sign = md5(type + priceStr + t + memo + key);',
+              'String sign = md5(type + priceStr + t + key);'
+          )
+
+          service = service.replace(
+              'String url = buildPushUrl(host, type, priceStr, t, memo, sign);',
+              'String url = buildPushUrl(host, type, priceStr, t, sign);'
+          )
+
+          service = service.replace(
+              'scheduleRetryCallback(type, price, priceStr, memo);',
+              'scheduleRetryCallback(type, price, priceStr);'
+          )
+
+          service = service.replace(
+              'private void scheduleRetryCallback(final int type, final double price, final String priceStr, final String memo) {',
+              'private void scheduleRetryCallback(final int type, final double price, final String priceStr) {'
+          )
+
+          # 注意：不加 Proxy.NO_PROXY，让 App 可以跟随手机系统代理/VPN
           main_path.write_text(main)
           service_path.write_text(service)
           manifest_path.write_text(manifest)
 
           print("Patch finished: HTTPS appHeart/appPush, system proxy enabled, no transMemo.")
           PY
-
-          python3 /tmp/patch_vmq.py
 
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
